@@ -309,8 +309,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
         name: str,
         value: ir.TensorBox,
         bound_vars: OrderedSet[sympy.Symbol],
+        code: HasWriteLine | None = None,
     ):
-        code = self.prefix
+        code = self.prefix if code is None else code
 
         @functools.cache
         def sizeof(name):
@@ -380,6 +381,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
             pass
         else:
             raise AssertionError(f"Unknown value type: {type(value)}")
+
+    def wrap_tensor_input_for_assign(self, tensor_expr: str) -> str:
+        return tensor_expr
 
     def generate_input_output_runtime_checks(self):
         """
@@ -2034,10 +2038,20 @@ class CppWrapperCpu(PythonWrapperCodegen):
 
     def codegen_subgraph_prefix(self, subgraph, outer_inputs, outer_outputs):
         assert len(subgraph.graph.graph_inputs) == len(outer_inputs)
+        bound_vars = OrderedSet[sympy.Symbol]()
 
         for (inner_input, inner_input_val), outer_input in zip(
             subgraph.graph.graph_inputs.items(), outer_inputs
         ):
+            if isinstance(inner_input_val, sympy.Expr):
+                if outer_input != str(inner_input_val):
+                    self.codegen_input_symbol_assignment(
+                        outer_input,
+                        inner_input_val,
+                        bound_vars,
+                        code=self,
+                    )
+                continue
             if not isinstance(inner_input_val, ir.TensorBox):
                 continue
 
@@ -2048,9 +2062,14 @@ class CppWrapperCpu(PythonWrapperCodegen):
             # can't necessarily std::move it back to the origin (x).
             self.writeline(f"AtenTensorHandle {inner_input}_handle;")
             self.writeline(
-                f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_assign_tensors_out({outer_input}, &{inner_input}_handle));"
+                "AOTI_TORCH_ERROR_CODE_CHECK("
+                f"aoti_torch_assign_tensors_out({self.wrap_tensor_input_for_assign(outer_input)}, "
+                f"&{inner_input}_handle));"
             )
             self.writeline(f"RAIIAtenTensorHandle {inner_input}({inner_input}_handle);")
+            self.codegen_input_symbol_assignment(
+                inner_input, inner_input_val, bound_vars, code=self
+            )
 
     def codegen_subgraph_suffix(self, subgraph, outer_inputs, outer_outputs):
         for inner_output, outer_output in zip(
@@ -2153,7 +2172,9 @@ class CppWrapperCpu(PythonWrapperCodegen):
             out_name = out.get_name()
             self.writeline(f"AtenTensorHandle {out_name}_handle;")
             self.writeline(
-                f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_assign_tensors_out({inp}, &{out_name}_handle));"
+                "AOTI_TORCH_ERROR_CODE_CHECK("
+                f"aoti_torch_assign_tensors_out({self.wrap_tensor_input_for_assign(inp)}, "
+                f"&{out_name}_handle));"
             )
             self.writeline(f"RAIIAtenTensorHandle {out_name}({out_name}_handle);")
             cond_outer_inputs.append(out_name)
