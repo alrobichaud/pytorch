@@ -478,6 +478,47 @@ def _non_strict_tracing_context():
         _is_non_strict_tracing_flag = old
 
 
+@contextlib.contextmanager
+def _patch_autograd_grad():
+    """Patch autograd.grad for non-strict make_fx tracing.
+
+    Under non-strict make_fx tracing, the autograd engine does not automatically
+    install the hooks that preserve backward stack traces / seq_nr metadata.
+    This patch installs those hooks and annotates the traced backward region
+    with custom["autograd_backward"] before delegating to the real
+    torch.autograd.grad.
+    """
+    import functools
+
+    import torch.autograd
+    import torch.fx.traceback as fx_traceback
+    from torch._functorch._aot_autograd.logging_utils import (
+        setup_stacktrace_preservation_hooks,
+    )
+
+    _orig_grad = torch.autograd.grad
+
+    @functools.wraps(_orig_grad)
+    def _patched_grad(outputs, inputs, *args, **kwargs):
+        if _is_non_strict_tracing():
+            roots = [
+                t.grad_fn
+                for t in (outputs if isinstance(outputs, (list, tuple)) else (outputs,))
+                if isinstance(t, torch.Tensor) and t.grad_fn is not None
+            ]
+            if roots:
+                setup_stacktrace_preservation_hooks(roots)
+
+        with fx_traceback.annotate({"autograd_backward": True}):
+            return _orig_grad(outputs, inputs, *args, **kwargs)
+
+    torch.autograd.grad = _patched_grad
+    try:
+        yield
+    finally:
+        torch.autograd.grad = _orig_grad
+
+
 def is_dynamo_compiling() -> bool:
     """
     Indicates whether a graph is traced via TorchDynamo.
